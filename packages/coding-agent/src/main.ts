@@ -14,6 +14,7 @@ import { processFileArguments } from "./cli/file-processor.ts";
 import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
 import { selectSession } from "./cli/session-picker.ts";
+import { handleSetupCommand } from "./cli/setup-command.ts";
 import { ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.ts";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
 import {
@@ -483,6 +484,10 @@ export async function main(args: string[], options?: MainOptions) {
 		cleanupWindowsSelfUpdateQuarantine(getPackageDir());
 	}
 
+	if (await handleSetupCommand(args)) {
+		return;
+	}
+
 	if (await handlePackageCommand(args)) {
 		return;
 	}
@@ -737,6 +742,7 @@ export async function main(args: string[], options?: MainOptions) {
 			initialImages,
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
+			runSetup: !startupBenchmark && !parsed.noSetup,
 		});
 		if (startupBenchmark) {
 			await interactiveMode.init();

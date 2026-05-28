@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a first-run setup wizard with automatic theme detection, analytics/crash-reporting consent, and optional provider login.
+
 ### Fixed
 
 - Fixed fenced `diff` code blocks and other highlight.js scopes to keep theme-aware syntax colors after the `cli-highlight` replacement ([#5092](https://github.com/earendil-works/pi/issues/5092)).

@@ -272,8 +272,9 @@ export class SettingsSelectorComponent extends Container {
 			},
 			{
 				id: "install-telemetry",
-				label: "Install telemetry",
-				description: "Send an anonymous version/update ping after changelog-detected updates",
+				label: "Crash reporting and analytics",
+				description:
+					"Allow anonymous diagnostics, including version/update analytics and crash reports when available",
 				currentValue: config.enableInstallTelemetry ? "true" : "false",
 				values: ["true", "false"],
 			},
