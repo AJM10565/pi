@@ -59,6 +59,11 @@ import {
 	getShareViewerUrl,
 	VERSION,
 } from "../../config.ts";
+import {
+	getStableActivitySyncDeviceId,
+	loadActivitySyncState,
+	syncSessionAnalytics,
+} from "../../core/activity-sync/index.ts";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type {
@@ -78,6 +83,17 @@ import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.t
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
+import {
+	formatPiDevShareSuccess,
+	getPiDevAuth,
+	loginPiDev,
+	PI_DEV_PROFILE_CONNECTED_STATUS,
+	PI_DEV_PROFILE_SCOPES,
+	PI_DEV_SESSION_SHARE_SCOPE,
+	parseShareCommand,
+	type ShareCommandMode,
+	uploadPiDevSessionShare,
+} from "../../core/pi-dev/index.ts";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
@@ -260,6 +276,10 @@ export interface InteractiveModeOptions {
 	initialMessages?: string[];
 	/** Force verbose startup (overrides quietStartup setting) */
 	verbose?: boolean;
+	/** Error from setup completed before interactive mode starts */
+	setupErrorMessage?: string;
+	/** Status from setup completed before interactive mode starts */
+	setupStatusMessage?: string;
 }
 
 export class InteractiveMode {
@@ -522,7 +542,7 @@ export class InteractiveMode {
 		}));
 
 		// Convert extension commands to SlashCommand format
-		const builtinCommandNames = new Set(slashCommands.map((c) => c.name));
+		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map((c) => c.name));
 		const extensionCommands: SlashCommand[] = this.session.extensionRunner
 			.getRegisteredCommands()
 			.filter((cmd) => !builtinCommandNames.has(cmd.name))
@@ -600,14 +620,6 @@ export class InteractiveMode {
 		if (this.isInitialized) return;
 
 		this.registerSignalHandlers();
-
-		// Load changelog (only show new entries, skip for resumed sessions)
-		this.changelogMarkdown = this.getChangelogForDisplay();
-
-		// Ensure fd and rg are available (downloads if missing, adds to PATH via getBinDir)
-		// Both are needed: fd for autocomplete, rg for grep tool and bash commands
-		const [fdPath] = await Promise.all([ensureTool("fd"), ensureTool("rg")]);
-		this.fdPath = fdPath;
 
 		if (this.session.scopedModels.length > 0 && (this.options.verbose || !this.settingsManager.getQuietStartup())) {
 			const modelList = this.session.scopedModels
@@ -701,22 +713,29 @@ export class InteractiveMode {
 		this.setupKeyHandlers();
 		this.setupEditorSubmitHandler();
 
-		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
+		// Start the UI before extension initialization so session_start handlers can use interactive dialogs.
 		this.ui.start();
 		this.isInitialized = true;
+
+		// Set up theme file watcher.
+		onThemeChange(() => {
+			this.ui.invalidate();
+			this.updateEditorBorderColor();
+			this.ui.requestRender();
+		});
+
+		this.changelogMarkdown = this.getChangelogForDisplay();
+
+		// Ensure fd and rg are available (downloads if missing, adds to PATH via getBinDir)
+		// Both are needed: fd for autocomplete, rg for grep tool and bash commands
+		const [fdPath] = await Promise.all([ensureTool("fd"), ensureTool("rg")]);
+		this.fdPath = fdPath;
 
 		// Initialize extensions first so resources are shown before messages
 		await this.rebindCurrentSession();
 
 		// Render initial messages AFTER showing loaded resources
 		this.renderInitialMessages();
-
-		// Set up theme file watcher
-		onThemeChange(() => {
-			this.ui.invalidate();
-			this.updateEditorBorderColor();
-			this.ui.requestRender();
-		});
 
 		// Set up git branch watcher (uses provider instead of footer)
 		this.footerDataProvider.onBranchChange(() => {
@@ -768,8 +787,25 @@ export class InteractiveMode {
 			}
 		});
 
+		this.maybeRunBackgroundActivitySync();
+
 		// Show startup warnings
-		const { migratedProviders, modelFallbackMessage, initialMessage, initialImages, initialMessages } = this.options;
+		const {
+			migratedProviders,
+			modelFallbackMessage,
+			initialMessage,
+			initialImages,
+			initialMessages,
+			setupErrorMessage,
+			setupStatusMessage,
+		} = this.options;
+
+		if (setupErrorMessage) {
+			this.showError(setupErrorMessage);
+		}
+		if (setupStatusMessage) {
+			this.showStatus(setupStatusMessage);
+		}
 
 		if (migratedProviders && migratedProviders.length > 0) {
 			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
@@ -780,7 +816,9 @@ export class InteractiveMode {
 			this.showError(`models.json error: ${modelsJsonError}`);
 		}
 
-		if (modelFallbackMessage) {
+		const staleNoModelsWarning =
+			modelFallbackMessage?.startsWith("No models available.") === true && !isUnknownModel(this.session.model);
+		if (modelFallbackMessage && !staleNoModelsWarning) {
 			this.showWarning(modelFallbackMessage);
 		}
 
@@ -913,6 +951,29 @@ export class InteractiveMode {
 		}
 
 		return undefined;
+	}
+
+	private maybeRunBackgroundActivitySync(): void {
+		const settings = this.settingsManager.getActivitySyncSettings();
+		if (!settings.enabled || process.env.PI_OFFLINE) return;
+
+		void loadActivitySyncState(getAgentDir())
+			.then((state) => {
+				const lastAttemptTime = state.lastAttemptAt ? new Date(state.lastAttemptAt).getTime() : 0;
+				if (
+					Number.isFinite(lastAttemptTime) &&
+					Date.now() - lastAttemptTime < settings.intervalHours * 60 * 60 * 1000
+				) {
+					return undefined;
+				}
+				return syncSessionAnalytics({
+					sessionsRoot: this.sessionManager.getSessionDir(),
+					settingsManager: this.settingsManager,
+					authStorage: this.session.modelRegistry.authStorage,
+				});
+			})
+			.then(() => undefined)
+			.catch(() => undefined);
 	}
 
 	private reportInstallTelemetry(version: string): void {
@@ -1140,7 +1201,11 @@ export class InteractiveMode {
 		}
 
 		if (source === "cli") {
-			return { label: "path", scopeLabel: scope === "temporary" ? "temp" : undefined, color: "muted" };
+			return {
+				label: "path",
+				scopeLabel: scope === "temporary" ? "temp" : undefined,
+				color: "muted",
+			};
 		}
 
 		const scopeLabel =
@@ -1380,7 +1445,9 @@ export class InteractiveMode {
 		if (showListing) {
 			const contextFiles = this.session.resourceLoader.getAgentsFiles().agentsFiles;
 			if (contextFiles.length > 0) {
-				this.chatContainer.addChild(new Spacer(1));
+				if (this.chatContainer.children.length > 0) {
+					this.chatContainer.addChild(new Spacer(1));
+				}
 				const contextList = contextFiles
 					.map((f) => theme.fg("dim", `  ${this.formatDisplayPath(f.path)}`))
 					.join("\n");
@@ -1394,7 +1461,10 @@ export class InteractiveMode {
 			const skills = skillsResult.skills;
 			if (skills.length > 0) {
 				const groups = this.buildScopeGroups(
-					skills.map((skill) => ({ path: skill.filePath, sourceInfo: skill.sourceInfo })),
+					skills.map((skill) => ({
+						path: skill.filePath,
+						sourceInfo: skill.sourceInfo,
+					})),
 				);
 				const skillList = this.formatScopeGroups(groups, {
 					formatPath: (item) => this.formatDisplayPath(item.path),
@@ -1407,7 +1477,10 @@ export class InteractiveMode {
 			const templates = this.session.promptTemplates;
 			if (templates.length > 0) {
 				const groups = this.buildScopeGroups(
-					templates.map((template) => ({ path: template.filePath, sourceInfo: template.sourceInfo })),
+					templates.map((template) => ({
+						path: template.filePath,
+						sourceInfo: template.sourceInfo,
+					})),
 				);
 				const templateByPath = new Map(templates.map((t) => [t.filePath, t]));
 				const templateList = this.formatScopeGroups(groups, {
@@ -1480,7 +1553,11 @@ export class InteractiveMode {
 			const extensionErrors = this.session.resourceLoader.getExtensions().errors;
 			if (extensionErrors.length > 0) {
 				for (const error of extensionErrors) {
-					extensionDiagnostics.push({ type: "error", message: error.error, path: error.path });
+					extensionDiagnostics.push({
+						type: "error",
+						message: error.error,
+						path: error.path,
+					});
 				}
 			}
 
@@ -2099,7 +2176,11 @@ export class InteractiveMode {
 					this.hideExtensionSelector();
 					resolve(undefined);
 				},
-				{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
+				{
+					tui: this.ui,
+					timeout: opts?.timeout,
+					onToggleToolsExpanded: () => this.toggleToolOutputExpansion(),
+				},
 			);
 
 			this.editorContainer.clear();
@@ -2541,8 +2622,8 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
-			if (text === "/share") {
-				await this.handleShareCommand();
+			if (text === "/share" || text.startsWith("/share ")) {
+				await this.handleShareCommand(text);
 				this.editor.setText("");
 				return;
 			}
@@ -2589,6 +2670,11 @@ export class InteractiveMode {
 			if (text === "/trust") {
 				this.showTrustSelector();
 				this.editor.setText("");
+				return;
+			}
+			if (text === "/pi.dev") {
+				this.editor.setText("");
+				await this.handlePiDevCommand();
 				return;
 			}
 			if (text === "/login") {
@@ -3221,7 +3307,10 @@ export class InteractiveMode {
 							} else {
 								errorMessage = message.errorMessage || "Error";
 							}
-							component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
+							component.updateResult({
+								content: [{ type: "text", text: errorMessage }],
+								isError: true,
+							});
 						} else {
 							renderedPendingTools.set(content.id, component);
 						}
@@ -3962,6 +4051,7 @@ export class InteractiveMode {
 					hideThinkingBlock: this.hideThinkingBlock,
 					collapseChangelog: this.settingsManager.getCollapseChangelog(),
 					enableInstallTelemetry: this.settingsManager.getEnableInstallTelemetry(),
+					activitySyncEnabled: this.settingsManager.getActivitySyncSettings().enabled,
 					doubleEscapeAction: this.settingsManager.getDoubleEscapeAction(),
 					treeFilterMode: this.settingsManager.getTreeFilterMode(),
 					showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
@@ -4054,6 +4144,9 @@ export class InteractiveMode {
 					},
 					onEnableInstallTelemetryChange: (enabled) => {
 						this.settingsManager.setEnableInstallTelemetry(enabled);
+					},
+					onActivitySyncChange: (enabled) => {
+						void this.handleActivitySyncSettingsChange(enabled);
 					},
 					onQuietStartupChange: (enabled) => {
 						this.settingsManager.setQuietStartup(enabled);
@@ -4682,6 +4775,16 @@ export class InteractiveMode {
 		});
 	}
 
+	private async authenticateLoginProvider(providerOption: AuthSelectorProvider): Promise<void> {
+		if (providerOption.authType === "oauth") {
+			await this.showLoginDialog(providerOption.id, providerOption.name);
+		} else if (providerOption.id === BEDROCK_PROVIDER_ID) {
+			await this.showBedrockSetupDialog(providerOption.id, providerOption.name);
+		} else {
+			await this.showApiKeyLoginDialog(providerOption.id, providerOption.name);
+		}
+	}
+
 	private showLoginProviderSelector(authType: "oauth" | "api_key"): void {
 		const providerOptions = this.getLoginProviderOptions(authType);
 		if (providerOptions.length === 0) {
@@ -4696,7 +4799,7 @@ export class InteractiveMode {
 				"login",
 				this.session.modelRegistry.authStorage,
 				providerOptions,
-				async (providerId: string) => {
+				(providerId: string) => {
 					done();
 
 					const providerOption = providerOptions.find((provider) => provider.id === providerId);
@@ -4704,13 +4807,7 @@ export class InteractiveMode {
 						return;
 					}
 
-					if (providerOption.authType === "oauth") {
-						await this.showLoginDialog(providerOption.id, providerOption.name);
-					} else if (providerOption.id === BEDROCK_PROVIDER_ID) {
-						this.showBedrockSetupDialog(providerOption.id, providerOption.name);
-					} else {
-						await this.showApiKeyLoginDialog(providerOption.id, providerOption.name);
-					}
+					void this.authenticateLoginProvider(providerOption);
 				},
 				() => {
 					done();
@@ -4824,32 +4921,35 @@ export class InteractiveMode {
 		}
 	}
 
-	private showBedrockSetupDialog(providerId: string, providerName: string): void {
-		const restoreEditor = () => {
+	private showBedrockSetupDialog(providerId: string, providerName: string): Promise<void> {
+		return new Promise((resolve) => {
+			const restoreEditor = () => {
+				this.editorContainer.clear();
+				this.editorContainer.addChild(this.editor);
+				this.ui.setFocus(this.editor);
+				this.ui.requestRender();
+				resolve();
+			};
+
+			const dialog = new LoginDialogComponent(
+				this.ui,
+				providerId,
+				() => restoreEditor(),
+				providerName,
+				"Amazon Bedrock setup",
+			);
+			dialog.showInfo([
+				theme.fg("text", "Amazon Bedrock uses AWS credentials instead of a single API key."),
+				theme.fg("text", "Configure an AWS profile, IAM keys, bearer token, or role-based credentials."),
+				theme.fg("muted", "See:"),
+				theme.fg("accent", `  ${path.join(getDocsPath(), "providers.md")}`),
+			]);
+
 			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
+			this.editorContainer.addChild(dialog);
+			this.ui.setFocus(dialog);
 			this.ui.requestRender();
-		};
-
-		const dialog = new LoginDialogComponent(
-			this.ui,
-			providerId,
-			() => restoreEditor(),
-			providerName,
-			"Amazon Bedrock setup",
-		);
-		dialog.showInfo([
-			theme.fg("text", "Amazon Bedrock uses AWS credentials instead of a single API key."),
-			theme.fg("text", "Configure an AWS profile, IAM keys, bearer token, or role-based credentials."),
-			theme.fg("muted", "See:"),
-			theme.fg("accent", `  ${path.join(getDocsPath(), "providers.md")}`),
-		]);
-
-		this.editorContainer.clear();
-		this.editorContainer.addChild(dialog);
-		this.ui.setFocus(dialog);
-		this.ui.requestRender();
+		});
 	}
 
 	private async showApiKeyLoginDialog(providerId: string, providerName: string): Promise<void> {
@@ -4882,14 +4982,17 @@ export class InteractiveMode {
 				throw new Error("API key cannot be empty.");
 			}
 
-			this.session.modelRegistry.authStorage.set(providerId, { type: "api_key", key: apiKey });
+			this.session.modelRegistry.authStorage.set(providerId, {
+				type: "api_key",
+				key: apiKey,
+			});
 
 			restoreEditor();
 			await this.completeProviderAuthentication(providerId, providerName, "api_key", previousModel);
 		} catch (error: unknown) {
 			restoreEditor();
-			const errorMsg = error instanceof Error ? error.message : String(error);
-			if (errorMsg !== "Login cancelled") {
+			if (!dialog.signal.aborted) {
+				const errorMsg = error instanceof Error ? error.message : String(error);
 				this.showError(`Failed to save API key for ${providerName}: ${errorMsg}`);
 			}
 		}
@@ -5014,8 +5117,8 @@ export class InteractiveMode {
 			await this.completeProviderAuthentication(providerId, providerName, "oauth", previousModel);
 		} catch (error: unknown) {
 			restoreEditor();
-			const errorMsg = error instanceof Error ? error.message : String(error);
-			if (errorMsg !== "Login cancelled") {
+			if (!dialog.signal.aborted) {
+				const errorMsg = error instanceof Error ? error.message : String(error);
 				this.showError(`Failed to login to ${providerName}: ${errorMsg}`);
 			}
 		}
@@ -5206,10 +5309,194 @@ export class InteractiveMode {
 		}
 	}
 
-	private async handleShareCommand(): Promise<void> {
+	private async handleShareCommand(text: string): Promise<void> {
+		const parsed = parseShareCommand(text);
+		if (!parsed.ok) {
+			this.showError(parsed.message);
+			return;
+		}
+
+		if (parsed.mode === "github") {
+			await this.handleGitHubShareCommand();
+			return;
+		}
+
+		if (parsed.mode === "auto") {
+			const auth = await getPiDevAuth(this.session.modelRegistry.authStorage, [PI_DEV_SESSION_SHARE_SCOPE]);
+			if (!auth.available) {
+				await this.handleGitHubShareCommand();
+				return;
+			}
+			await this.handlePiDevShareCommand(auth.accessToken, parsed.mode);
+			return;
+		}
+
+		const accessToken = await this.ensurePiDevAuthenticated([PI_DEV_SESSION_SHARE_SCOPE], {
+			title: "Create pi.dev profile to share sessions",
+		});
+		if (!accessToken) {
+			this.showStatus("Share cancelled");
+			return;
+		}
+
+		await this.handlePiDevShareCommand(accessToken, parsed.mode);
+	}
+
+	private async ensurePiDevAuthenticated(
+		requiredScopes: readonly string[],
+		options: { title: string; deviceId?: string; forceLogin?: boolean },
+	): Promise<string | undefined> {
+		if (!options.forceLogin) {
+			const auth = await getPiDevAuth(this.session.modelRegistry.authStorage, requiredScopes);
+			if (auth.available) return auth.accessToken;
+		}
+
+		return this.showPiDevLoginDialog(requiredScopes, options);
+	}
+
+	private async connectPiDevProfile(options: { title: string; forceLogin?: boolean }): Promise<string | undefined> {
+		const deviceId = getStableActivitySyncDeviceId(this.settingsManager);
+		await this.settingsManager.flush();
+		const accessToken = await this.ensurePiDevAuthenticated(PI_DEV_PROFILE_SCOPES, {
+			title: options.title,
+			deviceId,
+			forceLogin: options.forceLogin,
+		});
+		if (!accessToken) {
+			return undefined;
+		}
+
+		this.settingsManager.setActivitySyncEnabled(true);
+		await this.settingsManager.flush();
+		return accessToken;
+	}
+
+	private async showPiDevLoginDialog(
+		requiredScopes: readonly string[],
+		options: { title: string; deviceId?: string },
+	): Promise<string | undefined> {
+		const dialog = new LoginDialogComponent(
+			this.ui,
+			"pi.dev",
+			(_success, _message) => {
+				// Completion handled below.
+			},
+			"pi.dev",
+			options.title,
+		);
+
+		const restoreEditor = () => {
+			this.editorContainer.clear();
+			this.editorContainer.addChild(this.editor);
+			this.ui.setFocus(this.editor);
+			this.ui.requestRender();
+		};
+
+		this.editorContainer.clear();
+		this.editorContainer.addChild(dialog);
+		this.ui.setFocus(dialog);
+		this.ui.requestRender();
+
+		try {
+			const credential = await loginPiDev(this.session.modelRegistry.authStorage, {
+				scopes: requiredScopes,
+				deviceId: options.deviceId,
+				signal: dialog.signal,
+				onDeviceCode: (info) => {
+					dialog.showDeviceCode(info, { showUserCode: false });
+					dialog.showWaiting("Waiting for authentication...");
+				},
+			});
+			restoreEditor();
+			return credential.access;
+		} catch (error: unknown) {
+			restoreEditor();
+			if (!dialog.signal.aborted) {
+				const message = error instanceof Error ? error.message : String(error);
+				this.showError(`Failed to login to pi.dev: ${message}`);
+			}
+			return undefined;
+		}
+	}
+
+	private createShareHtmlTempPath(): string {
+		return path.join(os.tmpdir(), `pi-session-${crypto.randomUUID()}.html`);
+	}
+
+	private async exportShareHtml(tmpFile: string): Promise<number | undefined> {
+		try {
+			await this.session.exportToHtml(tmpFile);
+			const byteSize = fs.statSync(tmpFile).size;
+			if (byteSize <= 0) {
+				this.showError("Failed to export session: exported HTML is empty");
+				return undefined;
+			}
+			return byteSize;
+		} catch (error: unknown) {
+			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
+			return undefined;
+		}
+	}
+
+	private async handlePiDevShareCommand(accessToken: string, mode: ShareCommandMode): Promise<void> {
+		const tmpFile = this.createShareHtmlTempPath();
+		const byteSize = await this.exportShareHtml(tmpFile);
+		if (byteSize === undefined) {
+			return;
+		}
+
+		const loader = new BorderedLoader(this.ui, theme, "Uploading to pi.dev...");
+		this.editorContainer.clear();
+		this.editorContainer.addChild(loader);
+		this.ui.setFocus(loader);
+		this.ui.requestRender();
+
+		const abortController = new AbortController();
+		const restoreEditor = () => {
+			loader.dispose();
+			this.editorContainer.clear();
+			this.editorContainer.addChild(this.editor);
+			this.ui.setFocus(this.editor);
+			try {
+				fs.unlinkSync(tmpFile);
+			} catch {
+				// Ignore cleanup errors
+			}
+		};
+
+		loader.onAbort = () => {
+			abortController.abort();
+			restoreEditor();
+			this.showStatus("Share cancelled");
+		};
+
+		try {
+			const bytes = fs.readFileSync(tmpFile);
+			const result = await uploadPiDevSessionShare({
+				accessToken,
+				bytes,
+				byteSize,
+				signal: abortController.signal,
+			});
+			if (loader.signal.aborted) return;
+			restoreEditor();
+			this.showStatus(formatPiDevShareSuccess(result.url));
+		} catch (error: unknown) {
+			if (!loader.signal.aborted) {
+				restoreEditor();
+				const reason = error instanceof Error ? error.message : "Unknown error";
+				const suggestion = mode === "auto" ? "\nRun /share github to use the GitHub gist fallback." : "";
+				this.showError(`Failed to upload session to pi.dev: ${reason}${suggestion}`);
+			}
+		}
+	}
+
+	private async handleGitHubShareCommand(): Promise<void> {
 		// Check if gh is available and logged in
 		try {
-			const authResult = spawnSync("gh", ["auth", "status"], { encoding: "utf-8" });
+			const authResult = spawnSync("gh", ["auth", "status"], {
+				encoding: "utf-8",
+			});
 			if (authResult.status !== 0) {
 				this.showError("GitHub CLI is not logged in. Run 'gh auth login' first.");
 				return;
@@ -5220,11 +5507,9 @@ export class InteractiveMode {
 		}
 
 		// Export to a temp file
-		const tmpFile = path.join(os.tmpdir(), "session.html");
-		try {
-			await this.session.exportToHtml(tmpFile);
-		} catch (error: unknown) {
-			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
+		const tmpFile = this.createShareHtmlTempPath();
+		const byteSize = await this.exportShareHtml(tmpFile);
+		if (byteSize === undefined) {
 			return;
 		}
 
@@ -5257,7 +5542,11 @@ export class InteractiveMode {
 		};
 
 		try {
-			const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) => {
+			const result = await new Promise<{
+				stdout: string;
+				stderr: string;
+				code: number | null;
+			}>((resolve) => {
 				proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
 				let stdout = "";
 				let stderr = "";
@@ -5370,6 +5659,35 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(info, 1, 0));
 		this.ui.requestRender();
+	}
+
+	private async handlePiDevCommand(): Promise<void> {
+		const accessToken = await this.connectPiDevProfile({ title: "Create or sign in to pi.dev" });
+		if (!accessToken) {
+			this.showStatus("pi.dev login cancelled");
+			return;
+		}
+		this.showStatus(PI_DEV_PROFILE_CONNECTED_STATUS);
+		this.maybeRunBackgroundActivitySync();
+	}
+
+	private async handleActivitySyncSettingsChange(enabled: boolean): Promise<void> {
+		if (!enabled) {
+			this.settingsManager.setActivitySyncEnabled(false);
+			await this.settingsManager.flush();
+			this.showStatus("Activity sync disabled");
+			return;
+		}
+
+		const accessToken = await this.connectPiDevProfile({ title: "Create pi.dev profile for activity sync" });
+		if (!accessToken) {
+			this.settingsManager.setActivitySyncEnabled(false);
+			await this.settingsManager.flush();
+			this.showStatus("Activity sync unchanged");
+			return;
+		}
+		this.showStatus("Activity sync enabled");
+		this.maybeRunBackgroundActivitySync();
 	}
 
 	private handleChangelogCommand(): void {

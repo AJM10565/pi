@@ -40,6 +40,11 @@ export type AuthStatus = {
 	label?: string;
 };
 
+export interface RefreshOAuthCredentialOptions {
+	forceRefresh?: boolean;
+	shouldRemoveOnError?: (error: unknown) => boolean;
+}
+
 type LockResult<T> = {
 	result: T;
 	next?: string;
@@ -400,6 +405,52 @@ export class AuthStorage {
 	 */
 	logout(provider: string): void {
 		this.remove(provider);
+	}
+
+	/**
+	 * Refresh a stored OAuth credential while holding the backend lock.
+	 * If another process refreshed it first, the fresh credential is returned without calling refresh.
+	 */
+	async refreshOAuthCredentialWithLock(
+		providerId: string,
+		refresh: (credential: OAuthCredential) => Promise<OAuthCredential>,
+		options: RefreshOAuthCredentialOptions = {},
+	): Promise<OAuthCredential | undefined> {
+		return this.storage.withLockAsync(async (current) => {
+			const currentData = this.parseStorageData(current);
+			this.data = currentData;
+			this.loadError = null;
+
+			const credential = currentData[providerId];
+			if (credential?.type !== "oauth") {
+				return { result: undefined };
+			}
+
+			if (!options.forceRefresh && Date.now() < credential.expires) {
+				return { result: credential };
+			}
+
+			try {
+				const refreshed = await refresh(credential);
+				const merged: AuthStorageData = {
+					...currentData,
+					[providerId]: refreshed,
+				};
+				this.data = merged;
+				this.loadError = null;
+				return { result: refreshed, next: JSON.stringify(merged, null, 2) };
+			} catch (error) {
+				if (!options.shouldRemoveOnError?.(error)) {
+					throw error;
+				}
+
+				const merged: AuthStorageData = { ...currentData };
+				delete merged[providerId];
+				this.data = merged;
+				this.loadError = null;
+				return { result: undefined, next: JSON.stringify(merged, null, 2) };
+			}
+		});
 	}
 
 	/**
